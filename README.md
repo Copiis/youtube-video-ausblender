@@ -4,20 +4,20 @@ Userscript (Tampermonkey) — Videos per 🚫-Symbol ausblenden, Shorts ein-/aus
 
 ## Quelle
 
-**GitHub (Hauptquelle):** https://github.com/Copiis/youtube-video-ausblender
+**GitHub:** https://github.com/Copiis/youtube-video-ausblender
 
-Raw-URL (GreasyFork Code-Synchronisation + direkte Installation):
+**GreasyFork-Sync (Raw-URL):**
 
 ```
 https://raw.githubusercontent.com/Copiis/youtube-video-ausblender/master/YouTube-Video-Ausblender.user.js
 ```
 
-## Entwicklung
+Ausführliche Projekt-Regeln, AI-Workflow und Tampermonkey-Schritte: **`status.md`** (lokal/Syncthing).
 
-- Arbeitsdatei: `YouTube-Video-Ausblender.user.js`
-- Nach Änderung: `@version` erhöhen → `git add` → `commit` → `push`
-- GreasyFork holt Updates von der Raw-URL (Code-Synchronisation)
+## Schnellstart
 
-## GreasyFork
-
-Im GreasyFork-Editor unter **Code-Synchronisation** die Raw-URL oben eintragen.
+```bash
+./update-tampermonkey.sh    # nach Code-Änderung → Zwischenablage
+./git-push.sh "2026.x.y: …" # nur auf Kommando → GitHub
+./sync.sh url               # GreasyFork-URL in Zwischenablage
+```

@@ -5,3 +5,11 @@
 .DS_Store
 .stfolder/
 YouTube-Video-Ausblender.js
+status.md
+log.txt
+html.txt
+sync.sh
+update-tampermonkey.sh
+git-push.sh
+setup-github-auth.sh
+skills/
