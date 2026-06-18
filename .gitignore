@@ -1,0 +1,6 @@
+*.bak*
+.gh-token
+.gist-config
+.gist-id
+.DS_Store
+.stfolder/
