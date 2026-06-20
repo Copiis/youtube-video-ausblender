@@ -5,7 +5,7 @@
 // @name:fr Masqueur de Vidéos YouTube avec Icône 🚫 et Basculeur de Shorts
 // @name:it Nascondi Video YouTube con Icona 🚫 e Interruttore Shorts
 // @namespace https://github.com/Copiis/youtube-video-ausblender
-// @version 2026.4.20
+// @version 2026.6.20b
 // @description Adds a 🚫 symbol to video metadata for hiding videos, excludes Shorts thumbnails, with persistent Shorts toggle state
 // @description:de Fügt ein 🚫 Symbol zu Video-Metadaten hinzu, exklusive Shorts, und einen kompakten Button zum Ein-/Ausblenden von Shorts mit persistentem Zustand
 // @description:es Agrega un símbolo 🚫 a los metadatos de video, excluyendo Shorts, y un botón compacto para alternar Shorts con estado persistente
@@ -17,11 +17,10 @@
 // @match https://www.youtube.com/*
 // @grant GM_setValue
 // @grant GM_getValue
-// If you find this script useful and would like to support my work, consider making a small donation!
-// Bitcoin (BTC): bc1quc5mkudlwwkktzhvzw5u2nruxyepef957p68r7
-// PayPal: https://www.paypal.com/paypalme/Coopiis?country.x=DE&locale.x=de_DE
 // @downloadURL https://raw.githubusercontent.com/Copiis/youtube-video-ausblender/master/YouTube-Video-Ausblender.user.js
 // @updateURL https://raw.githubusercontent.com/Copiis/youtube-video-ausblender/master/YouTube-Video-Ausblender.user.js
+// @description If you find this script useful and would like to support my work, consider making a small donation!
+// @description GitHub Sponsors: https://github.com/sponsors/Copiis
 // ==/UserScript==
 
 (function () {
