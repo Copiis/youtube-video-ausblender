@@ -5,7 +5,7 @@
 // @name:fr Masqueur de Vidéos YouTube avec Icône 🚫 et Basculeur de Shorts
 // @name:it Nascondi Video YouTube con Icona 🚫 e Interruttore Shorts
 // @namespace https://github.com/Copiis/youtube-video-ausblender
-// @version 2026.6.21o
+// @version 2026.6.24j
 // @description Hide videos by ID with restore panel; synced list with upload time, sequential auto-hide
 // @description:de Videos per ID ausblenden mit Einblend-Panel; sync-Liste mit Upload-Zeit, serielles Auto-Ausblenden
 // @description:es Agrega un símbolo 🚫 a los metadatos de video, excluyendo Shorts, y un botón compacto para alternar Shorts con estado persistente
@@ -15,7 +15,7 @@
 // @author Copiis
 // @license MIT
 // @match https://www.youtube.com/*
-// @run-at document-start
+// @run-at document-idle
 // @grant GM_setValue
 // @grant GM_getValue
 // @downloadURL https://raw.githubusercontent.com/Copiis/youtube-video-ausblender/master/YouTube-Video-Ausblender.user.js
@@ -44,52 +44,245 @@
         hideBatchCooldownMs: 800,
         hideThumbnailFallbackMs: 2500,
         publishDateBackfillIntervalMs: 5000,
+        publishDateNetworkBatchDelayMs: 2500,
+        publishDateNetworkMaxPerSession: 12,
         scrollCheckMs: 200,
         thumbnailMinWidthPx: 120,
         thumbnailDecodeTimeoutMs: 500,
-        continuationGuardPx: 320
+        continuationGuardPx: 320,
+        playbackNavGuardMs: 8000,
+        playbackDomCleanupDelayMs: 8000
     };
 
     const HIDDEN_VIDEOS_KEY = 'hiddenVideoIds';
     const VIDEO_ID_PATTERN = /^[a-zA-Z0-9_-]{11}$/;
-    const VIDEO_CONTAINER_SELECTOR = 'ytd-rich-item-renderer, ytd-grid-video-renderer, ytd-compact-video-renderer';
+    const VIDEO_CONTAINER_SELECTOR = 'ytd-rich-item-renderer, ytd-grid-video-renderer, ytd-compact-video-renderer, ytd-video-renderer, yt-lockup-view-model';
+    const NESTED_VIDEO_CONTAINER_PARENT_SELECTOR = 'ytd-rich-item-renderer, ytd-grid-video-renderer, ytd-compact-video-renderer, ytd-video-renderer';
+    const PRIMARY_PLAYBACK_SELECTOR = '#movie_player, #player-container, #player-theater-container, #player-capabilities, ytd-shorts, ytd-reel-video-renderer';
+    const ALLOWED_HIDE_AREA_SELECTOR = 'ytd-watch-next-secondary-results-renderer, ytd-search, ytd-browse';
     const THUMBNAIL_HOST_SELECTOR = 'a.ytLockupViewModelContentImage, yt-lockup-view-model a, ytd-thumbnail a#thumbnail, ytd-thumbnail a, a#thumbnail, yt-thumbnail-view-model';
     const THUMBNAIL_SHADOW_HOST_SELECTOR = 'yt-img-shadow, yt-image, yt-thumbnail, ytd-thumbnail';
     const YTIMG_SRC_PATTERN = /ytimg\.com|ggpht\.com|googleusercontent\.com/;
     const EXCLUDED_UI_SELECTOR = 'ytd-guide-renderer, ytd-mini-guide-renderer, tp-yt-app-drawer, #guide, #guide-content, #guide-inner-content, ytd-masthead';
     const FEED_ROOT_SELECTOR = 'ytd-browse, ytd-page-manager, ytd-watch-flexy, ytd-search, #primary, #contents';
     const SHORTS_SHELF_SELECTOR = 'ytd-rich-shelf-renderer[is-shorts], ytd-rich-section-renderer ytd-rich-shelf-renderer[is-shorts], ytd-reel-shelf-renderer, ytm-shorts-lockup-view-model, ytd-rich-item-renderer[is-shelf-item]';
-    const PUBLISH_META_SELECTOR = '#metadata-line span.inline-metadata-item, #metadata-line yt-formatted-string, yt-content-metadata-view-model .yt-content-metadata-view-model__metadata-text, .yt-lockup-metadata-view-model__metadata-text, ytd-video-meta-block #metadata-line span, .ytContentMetadataViewModelMetadataText, .ytLockupMetadataViewModelMetadataText, [class*="ContentMetadataViewModelMetadataText"], span[role="text"][aria-label]';
+    const PUBLISH_META_SELECTOR = '#metadata-line span.inline-metadata-item, #metadata-line yt-formatted-string, ytd-video-meta-block span.inline-metadata-item, yt-content-metadata-view-model .yt-content-metadata-view-model__metadata-text, .yt-lockup-metadata-view-model__metadata-text, ytd-video-meta-block #metadata-line span, .ytContentMetadataViewModelMetadataText, .ytLockupMetadataViewModelMetadataText, [class*="ContentMetadataViewModelMetadataText"], span[role="text"][aria-label]';
     let hiddenVideoIdSet = new Set();
     let hiddenVideoEntries = [];
     let hiddenVideoPublishedAt = new Map();
     const publishDateFetchCache = new Map();
     let publishDateBackfillToken = 0;
+    let publishDateNetworkFetchedThisSession = 0;
     const pendingThumbnailHideWait = new WeakSet();
     const scheduledHideContainers = new WeakSet();
-    const observedFeedTargets = new WeakSet();
+    let observedFeedTargets = new WeakSet();
     let feedMutationObserver = null;
     let lastAppliedHideAt = 0;
     let hideBatchActive = false;
     let hideBatchCooldownTimer = null;
+    let navigationGuardUntil = 0;
+    let feedMaintenanceEnabled = true;
+    let browseFeaturesActive = false;
+    let mastheadMutationObserver = null;
+    let navigationListenersInstalled = false;
+    let playbackDomCleanupTimer = null;
+    const activeDateFetchControllers = new Set();
 
     function isInExcludedUiArea(element) {
         return !!(element && element.closest(EXCLUDED_UI_SELECTOR));
     }
 
+    function isPlaybackPage() {
+        const path = window.location.pathname || '';
+        return path === '/watch' || path.startsWith('/shorts/') || path === '/live';
+    }
+
+    function shouldShowHideButtons() {
+        return shouldRunFeedMaintenance();
+    }
+
+    function shouldRunFeedMaintenance() {
+        return feedMaintenanceEnabled && !isPlaybackPage() && !isNavigationGuardActive();
+    }
+
+    function stopHideBatch() {
+        hideBatchActive = false;
+        if (hideBatchCooldownTimer) {
+            clearTimeout(hideBatchCooldownTimer);
+            hideBatchCooldownTimer = null;
+        }
+    }
+
+    function removeMastheadButtons() {
+        closeRestoreListPanel();
+        document.querySelector('.shorts-toggle-wrapper')?.remove();
+        document.querySelector('.yt-ausblender-restore-wrapper')?.remove();
+    }
+
+    function stopAllIntervals() {
+        if (hideCheckIntervalId) {
+            clearInterval(hideCheckIntervalId);
+            hideCheckIntervalId = null;
+        }
+        if (backfillIntervalId) {
+            clearInterval(backfillIntervalId);
+            backfillIntervalId = null;
+        }
+        if (shortsCheckIntervalId) {
+            clearInterval(shortsCheckIntervalId);
+            shortsCheckIntervalId = null;
+        }
+    }
+
+    function disconnectFeedObservers() {
+        feedMutationObserver?.disconnect();
+        observedFeedTargets = new WeakSet();
+    }
+
+    function disconnectMastheadObserver() {
+        mastheadMutationObserver?.disconnect();
+        mastheadMutationObserver = null;
+        document.querySelector('ytd-masthead')?.removeAttribute('data-shorts-toggle-observed');
+    }
+
+    function pauseBrowseFeatures() {
+        browseFeaturesActive = false;
+        feedMaintenanceEnabled = false;
+        stopHideBatch();
+        cancelPendingNetworkDateFetches();
+        disconnectMastheadObserver();
+        disconnectFeedObservers();
+        stopAllIntervals();
+    }
+
+    function cleanupBrowseDom() {
+        try {
+            removeAllHideButtons();
+            removeMastheadButtons();
+        } catch (err) {
+            if (config.debugMode) console.log('[Ausblender] DOM-Cleanup:', err.message);
+        }
+    }
+
+    function cancelPlaybackDomCleanup() {
+        if (playbackDomCleanupTimer) {
+            clearTimeout(playbackDomCleanupTimer);
+            playbackDomCleanupTimer = null;
+        }
+    }
+
+    function schedulePlaybackDomCleanup() {
+        cancelPlaybackDomCleanup();
+        playbackDomCleanupTimer = setTimeout(() => {
+            playbackDomCleanupTimer = null;
+            if (!isPlaybackPage()) return;
+            cleanupBrowseDom();
+        }, config.playbackDomCleanupDelayMs);
+    }
+
+    function teardownBrowseFeatures() {
+        pauseBrowseFeatures();
+        cleanupBrowseDom();
+    }
+
+    function startBrowseFeatures() {
+        if (browseFeaturesActive) return;
+        browseFeaturesActive = true;
+        feedMaintenanceEnabled = true;
+
+        installHideInteractionGuard();
+        observeFeedSections();
+        ensureFeedObserver();
+        observeMastheadForToggleButton();
+        migrateHideButtonsOutOfAnchors();
+        removeLegacyHideButtons();
+        addShortsToggleButton();
+        addRestoreListButton();
+        updateRestoreListButtonLabel();
+        ensureShortsCheckInterval();
+        checkShortsSection();
+        ensureFeedIntervalsStarted();
+
+        setTimeout(runContinuousHideCheck, 300);
+        setTimeout(runContinuousHideCheck, 800);
+        setTimeout(() => maintainButtonsNearViewport(config.viewportButtonRefreshMax), 1000);
+    }
+
+    function restoreWatchPrimaryHiddenContainers() {
+        document.querySelectorAll('ytd-watch-flexy [data-hidden-by-script]').forEach((container) => {
+            if (!container.closest('ytd-watch-next-secondary-results-renderer')) {
+                restoreVideoContainer(container);
+            }
+        });
+
+        document.querySelectorAll('ytd-watch-flexy #primary ytd-rich-section-renderer, ytd-watch-flexy #primary ytd-rich-item-renderer, ytd-watch-flexy #primary yt-lockup-view-model').forEach((element) => {
+            if (element.closest('ytd-watch-next-secondary-results-renderer')) return;
+            if (element.hasAttribute('data-hidden-by-script')) return;
+            if (element.style.display === 'none') element.style.display = '';
+        });
+    }
+
+    function isTopLevelVideoContainer(element) {
+        if (!element) return false;
+        if (element.matches('yt-lockup-view-model')) {
+            return !element.closest(NESTED_VIDEO_CONTAINER_PARENT_SELECTOR);
+        }
+        return true;
+    }
+
+    function isInPrimaryPlaybackArea(element) {
+        if (!element) return false;
+        if (element.closest(ALLOWED_HIDE_AREA_SELECTOR)) return false;
+        return !!element.closest(PRIMARY_PLAYBACK_SELECTOR);
+    }
+
+    function isNavigationGuardActive() {
+        return Date.now() < navigationGuardUntil;
+    }
+
+    function activateNavigationGuard(durationMs = config.playbackNavGuardMs) {
+        navigationGuardUntil = Math.max(navigationGuardUntil, Date.now() + durationMs);
+    }
+
+    function cancelPendingNetworkDateFetches() {
+        publishDateBackfillToken += 1;
+        activeDateFetchControllers.forEach((controller) => {
+            try {
+                controller.abort();
+            } catch (err) {
+                if (config.debugMode) console.log('[Ausblender] Fetch-Abort:', err.message);
+            }
+        });
+        activeDateFetchControllers.clear();
+    }
+
+    function canRunNetworkDateBackfill() {
+        if (isNavigationGuardActive()) return false;
+        if (isPlaybackPage()) return false;
+        if (typeof navigator !== 'undefined' && navigator.onLine === false) return false;
+        if (typeof document !== 'undefined' && document.hidden) return false;
+        return true;
+    }
+
+    function isAllowedMaintenanceContainer(container) {
+        if (!shouldRunFeedMaintenance()) return false;
+        return isHideableFeedContainer(container);
+    }
+
     function isFeedVideoContainer(element) {
-        return !!(element && element.matches(VIDEO_CONTAINER_SELECTOR) && !isInExcludedUiArea(element));
+        return !!(element && element.matches(VIDEO_CONTAINER_SELECTOR) && isTopLevelVideoContainer(element) && !isInExcludedUiArea(element));
     }
 
     function isHideableFeedContainer(container) {
         if (!isFeedVideoContainer(container)) return false;
+        if (isInPrimaryPlaybackArea(container)) return false;
         if (container.closest('ytd-continuation-item-renderer')) return false;
         if (container.hasAttribute('is-shelf-item')) return false;
         return true;
     }
 
     function shouldHideById(container) {
-        if (!isHideableFeedContainer(container)) return false;
+        if (!isAllowedMaintenanceContainer(container)) return false;
         const videoId = extractVideoId(container);
         return !!(videoId && hiddenVideoIdSet.has(videoId));
     }
@@ -262,7 +455,8 @@
     function isHydratedVideoContainer(container) {
         if (!extractVideoId(container) || !findThumbnailHost(container)) return false;
         return !!(
-            container.querySelector('yt-lockup-view-model, ytd-rich-grid-media, #video-title, h3 a, .yt-lockup-metadata-view-model__title, [class*="LockupMetadata"], [class*="ContentMetadataViewModel"], span[role="text"][aria-label]')
+            container.matches('yt-lockup-view-model, ytd-video-renderer')
+            || container.querySelector('yt-lockup-view-model, ytd-rich-grid-media, #video-title, h3 a, .yt-lockup-metadata-view-model__title, [class*="LockupMetadata"], [class*="ContentMetadataViewModel"], span[role="text"][aria-label]')
             || getThumbnailImage(container)
         );
     }
@@ -278,6 +472,7 @@
     }
 
     function canAutoHideNow(container) {
+        if (isNavigationGuardActive()) return false;
         if (!shouldHideById(container)) return false;
         if (!extractVideoId(container) || !findThumbnailHost(container)) return false;
         return isNearViewport(container);
@@ -288,13 +483,15 @@
     }
 
     function isReadyForButton(element) {
-        if (!isHideableFeedContainer(element)) return false;
+        if (!shouldShowHideButtons()) return false;
+        if (isNavigationGuardActive()) return false;
+        if (!isAllowedMaintenanceContainer(element)) return false;
         if (!extractVideoId(element)) return false;
         if (!findThumbnailHost(element)) return false;
         return true;
     }
 
-    const FEED_CONTENTS_SELECTOR = 'ytd-rich-grid-renderer #contents, ytd-rich-section-renderer #contents, ytd-item-section-renderer #contents, ytd-section-list-renderer #contents, ytd-shelf-renderer #contents, ytd-watch-next-secondary-results-renderer #items';
+    const FEED_CONTENTS_SELECTOR = 'ytd-rich-grid-renderer #contents, ytd-rich-section-renderer #contents, ytd-item-section-renderer #contents, ytd-section-list-renderer #contents, ytd-shelf-renderer #contents, ytd-search #contents';
 
     function getFeedContentRoots() {
         const roots = Array.from(document.querySelectorAll(FEED_CONTENTS_SELECTOR))
@@ -321,8 +518,10 @@
     }
 
     function queryShortsSections() {
+        if (isPlaybackPage()) return [];
+
         const sections = [];
-        const roots = document.querySelectorAll(FEED_ROOT_SELECTOR);
+        const roots = document.querySelectorAll('ytd-browse, ytd-page-manager, ytd-search, #contents');
 
         if (roots.length === 0) {
             document.querySelectorAll(SHORTS_SHELF_SELECTOR).forEach((section) => {
@@ -478,6 +677,18 @@
         return hours <= 9 && minutes <= 59 && seconds <= 59;
     }
 
+    function looksLikeViewCountToken(text) {
+        const raw = (text || '').trim();
+        if (!raw) return false;
+        const lower = raw.toLowerCase();
+
+        if (/\b(?:views?|aufrufe?|visualizaciones|visualizzazioni|wyświetle|观看|조회)\b/i.test(lower)) return true;
+        if (/\b(?:vor\s+|ago|gestern|yesterday|heute|today|gerade eben|just now|gestreamt|streamed|premiere)\b/i.test(lower)) return false;
+        if (/\b(?:mrd|milliarden|billion|million|mio\.?|bio\.?|tys\.?)\b/i.test(lower)) return true;
+        if (/^\d[\d.,\s]*(?:\s*(?:k|m|b|mrd|mio|tys))?\.?$/i.test(lower)) return true;
+        return false;
+    }
+
     function sanitizePublishTimestamp(ts) {
         return isPlausiblePublishTimestamp(ts) ? ts : 0;
     }
@@ -533,6 +744,8 @@
     }
 
     function backfillPublishedAtFromVisibleDom() {
+        if (!shouldRunFeedMaintenance()) return;
+
         document.querySelectorAll(`${VIDEO_CONTAINER_SELECTOR}[data-hidden-by-script]`).forEach((container) => {
             backfillPublishedAtFromDom(container);
         });
@@ -550,21 +763,37 @@
 
     function fetchPublishedAtFromVideoPage(videoId) {
         if (!videoId) return Promise.resolve(0);
+        if (!canRunNetworkDateBackfill()) return Promise.resolve(0);
+        if (publishDateNetworkFetchedThisSession >= config.publishDateNetworkMaxPerSession) {
+            return Promise.resolve(0);
+        }
 
         const cached = publishDateFetchCache.get(videoId);
         if (typeof cached === 'number') return Promise.resolve(cached);
         if (cached) return cached;
 
-        const request = fetch(`https://www.youtube.com/watch?v=${videoId}`, { credentials: 'same-origin' })
+        publishDateNetworkFetchedThisSession += 1;
+        const controller = new AbortController();
+        activeDateFetchControllers.add(controller);
+
+        const request = fetch(`https://www.youtube.com/watch?v=${videoId}`, {
+            credentials: 'same-origin',
+            signal: controller.signal
+        })
             .then((response) => (response.ok ? response.text() : ''))
             .then((html) => {
                 const ts = parseUploadDateFromHtml(html);
                 publishDateFetchCache.set(videoId, ts);
                 return ts;
             })
-            .catch(() => {
-                publishDateFetchCache.set(videoId, 0);
+            .catch((err) => {
+                if (err?.name !== 'AbortError') {
+                    publishDateFetchCache.set(videoId, 0);
+                }
                 return 0;
+            })
+            .finally(() => {
+                activeDateFetchControllers.delete(controller);
             });
 
         publishDateFetchCache.set(videoId, request);
@@ -584,16 +813,27 @@
     }
 
     function backfillMissingPublishedDatesFromNetwork() {
+        if (!canRunNetworkDateBackfill()) {
+            if (config.debugMode) {
+                console.log('[Ausblender] Upload-Datum-Netzwerk-Backfill übersprungen (Wiedergabe/Offline)');
+            }
+            return;
+        }
+
         const missingIds = hiddenVideoEntries
             .filter((entry) => !entry.publishedAt)
             .map((entry) => entry.id);
         if (missingIds.length === 0) return;
 
         const token = ++publishDateBackfillToken;
-        const batchSize = 3;
+        const batchSize = 2;
+        const batchDelayMs = config.publishDateNetworkBatchDelayMs;
 
         const runBatch = (startIndex) => {
             if (token !== publishDateBackfillToken) return;
+            if (!canRunNetworkDateBackfill()) return;
+            if (publishDateNetworkFetchedThisSession >= config.publishDateNetworkMaxPerSession) return;
+
             const batch = missingIds.slice(startIndex, startIndex + batchSize);
             if (batch.length === 0) return;
 
@@ -602,11 +842,13 @@
             }))).finally(() => {
                 if (token !== publishDateBackfillToken) return;
                 updateRestorePanelDates();
-                runBatch(startIndex + batchSize);
+                if (startIndex + batchSize < missingIds.length) {
+                    setTimeout(() => runBatch(startIndex + batchSize), batchDelayMs);
+                }
             });
         };
 
-        runBatch(0);
+        setTimeout(() => runBatch(0), 1500);
     }
 
     function parsePublishTextToTimestamp(text) {
@@ -619,6 +861,7 @@
         const lower = raw.toLowerCase().replace(/\.$/, '');
         const relativeText = lower
             .replace(/^(?:premiere|streamed live|live|uploaded|published|veröffentlicht)\s+/i, '')
+            .replace(/\s+(?:gestreamt|streamed)(?:\s+live)?$/i, '')
             .trim();
 
         const relativeRules = [
@@ -692,7 +935,8 @@
 
     function pushPublishTextCandidate(bucket, text) {
         const trimmed = (text || '').trim();
-        if (trimmed) bucket.push(trimmed);
+        if (!trimmed || looksLikeViewCountToken(trimmed)) return;
+        bucket.push(trimmed);
     }
 
     function collectPublishTextCandidates(container) {
@@ -797,7 +1041,7 @@
         container.removeAttribute('data-hidden-video-id');
         container.removeAttribute('data-hide-button-added');
         scheduledHideContainers.delete(container);
-        maintainButtons([container]);
+        if (shouldRunFeedMaintenance()) maintainButtons([container]);
     }
 
     function restoreHiddenContainersForId(videoId) {
@@ -997,6 +1241,7 @@
     }
 
     function addRestoreListButton() {
+        if (isPlaybackPage()) return;
         if (document.querySelector('.yt-ausblender-restore-wrapper')) return;
 
         const buttonsHost = findMastheadButtonsHost();
@@ -1178,6 +1423,7 @@
     }
 
     function processHideBatch() {
+        if (!shouldRunFeedMaintenance()) return;
         if (hideBatchActive) return;
         if (hiddenVideoIdSet.size === 0) return;
 
@@ -1231,6 +1477,9 @@
     }
 
     function findThumbnailHost(video) {
+        if (!video) return null;
+        if (video.matches?.('a.ytLockupViewModelContentImage, yt-thumbnail-view-model, a#thumbnail')) return video;
+
         for (const selector of THUMBNAIL_HOST_SELECTOR.split(', ')) {
             const host = video.querySelector(selector);
             if (host) return host;
@@ -1249,7 +1498,7 @@
         if (video.hasAttribute('data-hidden-by-script') || shouldHideById(video)) return false;
         if (video.hasAttribute('data-hide-button-added')) {
             const host = findThumbnailHost(video);
-            if (host?.querySelector('.hide-video-btn')) return false;
+            if (findExistingHideButton(host)) return false;
             video.removeAttribute('data-hide-button-added');
         }
         return isReadyForButton(video);
@@ -1272,7 +1521,7 @@
         const near = [];
 
         document.querySelectorAll(VIDEO_CONTAINER_SELECTOR).forEach((element) => {
-            if (!isHideableFeedContainer(element) || seen.has(element)) return;
+            if (!isAllowedMaintenanceContainer(element) || seen.has(element)) return;
             if (!isNearViewport(element)) return;
             seen.add(element);
             near.push(element);
@@ -1288,6 +1537,7 @@
     }
 
     function maintainButtonsNearViewport(limit = config.viewportBatchMax) {
+        if (!shouldShowHideButtons()) return;
         const near = collectContainersNearViewport();
         if (near.length === 0) return;
         maintainButtons(limit > 0 ? near.slice(0, limit) : near);
@@ -1304,6 +1554,7 @@
     }
 
     function runContinuousHideCheck() {
+        if (!shouldRunFeedMaintenance()) return;
         maintainButtonsNearViewport(config.viewportButtonRefreshMax);
         processHideBatch();
     }
@@ -1331,14 +1582,15 @@
             backdropFilter: 'blur(4px)',
             zIndex: '10010',
             position: 'absolute',
-            left: '10px',
+            right: '10px',
             bottom: '10px',
             margin: '0',
             padding: '0',
             pointerEvents: 'auto'
         });
 
-        const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+        const svgNs = 'http://www.w3.org/2000/svg';
+        const svg = document.createElementNS(svgNs, 'svg');
         svg.setAttribute('width', '22');
         svg.setAttribute('height', '22');
         svg.setAttribute('viewBox', '0 0 24 24');
@@ -1347,7 +1599,20 @@
         svg.setAttribute('stroke-width', '2');
         svg.setAttribute('stroke-linecap', 'round');
         svg.setAttribute('stroke-linejoin', 'round');
-        svg.innerHTML = '<circle cx="12" cy="12" r="10"></circle><line x1="5" y1="5" x2="19" y2="19"></line>';
+
+        const circle = document.createElementNS(svgNs, 'circle');
+        circle.setAttribute('cx', '12');
+        circle.setAttribute('cy', '12');
+        circle.setAttribute('r', '10');
+
+        const line = document.createElementNS(svgNs, 'line');
+        line.setAttribute('x1', '5');
+        line.setAttribute('y1', '5');
+        line.setAttribute('x2', '19');
+        line.setAttribute('y2', '19');
+
+        svg.appendChild(circle);
+        svg.appendChild(line);
         button.appendChild(svg);
 
         button.addEventListener('mouseenter', () => {
@@ -1409,27 +1674,60 @@
         };
     }
 
-    function isHideButtonOnThumbnail(btn) {
-        return !!btn.closest('a.ytLockupViewModelContentImage, ytd-thumbnail a#thumbnail, ytd-thumbnail a, a#thumbnail');
+    function isHideButtonInsideAnchor(btn) {
+        return !!btn.closest('a[href*="watch"], a[href*="/shorts/"], a#thumbnail, a.ytLockupViewModelContentImage');
+    }
+
+    function getHideButtonMountHost(thumbnailHost) {
+        if (!thumbnailHost) return null;
+        if (thumbnailHost.matches('a[href*="watch"], a[href*="/shorts/"], a#thumbnail, a.ytLockupViewModelContentImage')) {
+            return thumbnailHost.parentElement || thumbnailHost;
+        }
+        return thumbnailHost;
+    }
+
+    function findExistingHideButton(thumbnailHost) {
+        if (!thumbnailHost) return null;
+        const mountHost = getHideButtonMountHost(thumbnailHost);
+        return mountHost?.querySelector(':scope > .hide-video-btn')
+            || thumbnailHost.querySelector('.hide-video-btn')
+            || null;
+    }
+
+    function migrateHideButtonsOutOfAnchors() {
+        document.querySelectorAll('a .hide-video-btn').forEach((btn) => {
+            const anchor = btn.closest('a[href*="watch"], a[href*="/shorts/"], a#thumbnail, a.ytLockupViewModelContentImage');
+            if (!anchor?.parentElement) return;
+
+            const mountHost = anchor.parentElement;
+            anchor.classList.remove('hide-video-btn-host');
+            mountHost.classList.add('hide-video-btn-host');
+            mountHost.appendChild(btn);
+        });
     }
 
     let legacyCleanupDone = false;
 
     function removeLegacyHideButtons() {
+        migrateHideButtonsOutOfAnchors();
+
         if (legacyCleanupDone) return;
         legacyCleanupDone = true;
 
         document.querySelectorAll('.hide-video-btn').forEach((btn) => {
-            if (isHideButtonOnThumbnail(btn)) return;
-
             const video = btn.closest(VIDEO_CONTAINER_SELECTOR);
-            btn.remove();
+            if (!video) {
+                btn.remove();
+                return;
+            }
 
-            if (video) {
-                const thumbnailHost = findThumbnailHost(video);
-                if (!thumbnailHost?.querySelector('.hide-video-btn')) {
-                    video.removeAttribute('data-hide-button-added');
-                }
+            const thumbnailHost = findThumbnailHost(video);
+            const mountHost = getHideButtonMountHost(thumbnailHost);
+            if (mountHost && btn.parentElement === mountHost) return;
+
+            btn.remove();
+            if (!findExistingHideButton(thumbnailHost)) {
+                video.removeAttribute('data-hide-button-added');
             }
         });
     }
@@ -1459,21 +1757,57 @@
         return containers;
     }
 
+    function removeAllHideButtons() {
+        document.querySelectorAll('.hide-video-btn').forEach((btn) => {
+            const video = btn.closest(VIDEO_CONTAINER_SELECTOR);
+            const mountHost = btn.parentElement;
+            btn.remove();
+            mountHost?.classList.remove('hide-video-btn-host');
+
+            if (video) {
+                findThumbnailHost(video)?.classList.remove('hide-video-btn-host');
+                video.removeAttribute('data-hide-button-added');
+            }
+        });
+    }
+
     function attachHideButton(video) {
-        const thumbnailHost = findThumbnailHost(video);
-        if (!thumbnailHost) return false;
-        if (thumbnailHost.querySelector('.hide-video-btn')) {
+        if (!shouldShowHideButtons()) return false;
+
+        try {
+            const thumbnailHost = findThumbnailHost(video);
+            if (!thumbnailHost) return false;
+
+            const existingButton = findExistingHideButton(thumbnailHost);
+            if (existingButton) {
+                if (isHideButtonInsideAnchor(existingButton)) {
+                    const mountHost = getHideButtonMountHost(thumbnailHost);
+                    if (mountHost) {
+                        thumbnailHost.classList.remove('hide-video-btn-host');
+                        mountHost.classList.add('hide-video-btn-host');
+                        mountHost.appendChild(existingButton);
+                    }
+                }
+                video.setAttribute('data-hide-button-added', 'true');
+                return false;
+            }
+
+            const mountHost = getHideButtonMountHost(thumbnailHost);
+            if (!mountHost) return false;
+
+            thumbnailHost.classList.remove('hide-video-btn-host');
+            mountHost.classList.add('hide-video-btn-host');
+            mountHost.appendChild(createHideButton(userLang === 'de' ? 'Video ausblenden' : 'Hide video'));
             video.setAttribute('data-hide-button-added', 'true');
+            return true;
+        } catch (err) {
+            if (config.debugMode) console.log('[Ausblender] attachHideButton:', err.message);
             return false;
         }
-
-        thumbnailHost.classList.add('hide-video-btn-host');
-        thumbnailHost.appendChild(createHideButton(userLang === 'de' ? 'Video ausblenden' : 'Hide video'));
-        video.setAttribute('data-hide-button-added', 'true');
-        return true;
     }
 
     function maintainButtons(containers) {
+        if (!shouldShowHideButtons()) return;
         let addedCount = 0;
         for (const video of containers) {
             if (needsHideButton(video) && attachHideButton(video)) addedCount += 1;
@@ -1488,6 +1822,8 @@
     }
 
     const runFeedMaintenance = debounce((addedNodes = []) => {
+        if (!shouldRunFeedMaintenance()) return;
+
         if (addedNodes.length === 0) {
             runContinuousHideCheck();
             return;
@@ -1499,10 +1835,12 @@
     }, config.debounceMs);
 
     function queueFeedMaintenance(addedNodes = []) {
+        if (!shouldRunFeedMaintenance()) return;
         runFeedMaintenance(addedNodes);
     }
 
     const onViewportScroll = throttle(() => {
+        if (!shouldRunFeedMaintenance()) return;
         maintainButtonsNearViewport();
         runContinuousHideCheck();
     }, config.scrollCheckMs);
@@ -1510,6 +1848,16 @@
     let isShortsHidden = GM_getValue('isShortsHidden', false);
     let shortsCheckIntervalId = null;
     let hideCheckIntervalId = null;
+    let backfillIntervalId = null;
+
+    function ensureFeedIntervalsStarted() {
+        if (!hideCheckIntervalId) {
+            hideCheckIntervalId = setInterval(runContinuousHideCheck, config.hideCheckIntervalMs);
+        }
+        if (!backfillIntervalId) {
+            backfillIntervalId = setInterval(backfillPublishedAtFromVisibleDom, config.publishDateBackfillIntervalMs);
+        }
+    }
 
     function findMastheadButtonsHost() {
         return document.querySelector('ytd-masthead #end #buttons')
@@ -1521,6 +1869,14 @@
         const shortsButton = wrapper?.querySelector('.shorts-toggle-btn');
         const iconSpan = wrapper?.querySelector('.shorts-toggle-icon');
         if (!shortsButton || !iconSpan) return;
+
+        shortsButton.classList.toggle('shorts-toggle-btn--active', isShortsHidden);
+        iconSpan.style.display = isShortsHidden ? 'inline-flex' : 'none';
+
+        if (isPlaybackPage()) {
+            shortsButton.disabled = false;
+            return;
+        }
 
         const shortsSections = queryShortsSections();
         if (shortsSections.length > 0) {
@@ -1557,6 +1913,7 @@
     }
 
     function addShortsToggleButton() {
+        if (isPlaybackPage()) return;
         if (document.querySelector('.shorts-toggle-wrapper')) return;
 
         const buttonsHost = findMastheadButtonsHost();
@@ -1608,15 +1965,23 @@
     }
 
     function observeMastheadForToggleButton() {
+        if (isPlaybackPage()) return;
+
         const attach = () => {
+            if (isPlaybackPage()) return;
+
             const masthead = document.querySelector('ytd-masthead');
             if (!masthead || masthead.dataset.shortsToggleObserved === 'true') return;
             masthead.dataset.shortsToggleObserved = 'true';
-            const mastheadObserver = new MutationObserver(() => {
+            mastheadMutationObserver = new MutationObserver(() => {
+                if (isPlaybackPage()) {
+                    removeMastheadButtons();
+                    return;
+                }
                 addShortsToggleButton();
                 addRestoreListButton();
             });
-            mastheadObserver.observe(masthead, { childList: true, subtree: true });
+            mastheadMutationObserver.observe(masthead, { childList: true, subtree: true });
             addShortsToggleButton();
             addRestoreListButton();
         };
@@ -1642,7 +2007,7 @@
             'ytd-rich-section-renderer #contents',
             'ytd-item-section-renderer #contents',
             'ytd-section-list-renderer #contents',
-            'ytd-watch-next-secondary-results-renderer #items'
+            'ytd-search #contents'
         ];
         const seen = new Set();
         const targets = [];
@@ -1740,7 +2105,7 @@
             cursor: pointer !important;
             pointer-events: auto !important;
             position: absolute !important;
-            left: 10px !important;
+            right: 10px !important;
             bottom: 10px !important;
             z-index: 10010 !important;
             box-shadow: 0 2px 10px rgba(0, 0, 0, 0.35) !important;
@@ -1956,39 +2321,47 @@
         (document.head || document.documentElement).appendChild(style);
     }
 
-    installHideInteractionGuard();
+    function onNavigationStart() {
+        cancelPlaybackDomCleanup();
+        pauseBrowseFeatures();
+        activateNavigationGuard(config.playbackNavGuardMs);
+    }
+
+    function onNavigationFinish() {
+        refreshHiddenVideoSet();
+
+        if (isPlaybackPage()) {
+            pauseBrowseFeatures();
+            schedulePlaybackDomCleanup();
+        } else {
+            cancelPlaybackDomCleanup();
+            startBrowseFeatures();
+        }
+    }
+
+    function setupNavigationListeners() {
+        if (navigationListenersInstalled) return;
+        navigationListenersInstalled = true;
+        document.addEventListener('yt-navigate-start', onNavigationStart);
+        document.addEventListener('yt-navigate-finish', onNavigationFinish);
+    }
 
     function initialize() {
         try {
             injectStyles();
-            observeMastheadForToggleButton();
-            observeFeedSections();
-            ensureFeedObserver();
             refreshHiddenVideoSet();
-            backfillMissingPublishedDatesFromNetwork();
-            removeLegacyHideButtons();
-            addShortsToggleButton();
-            addRestoreListButton();
-            updateRestoreListButtonLabel();
-            ensureShortsCheckInterval();
-            checkShortsSection();
+            setupNavigationListeners();
             window.addEventListener('scroll', onViewportScroll, { passive: true });
             document.addEventListener('keydown', (e) => {
                 if (e.key === 'Escape') closeRestoreListPanel();
             }, true);
-            document.addEventListener('yt-navigate-finish', () => {
-                closeRestoreListPanel();
-                refreshHiddenVideoSet();
-                updateRestoreListButtonLabel();
-                setTimeout(runContinuousHideCheck, 300);
-            });
-            if (!hideCheckIntervalId) {
-                hideCheckIntervalId = setInterval(runContinuousHideCheck, config.hideCheckIntervalMs);
+
+            if (isPlaybackPage()) {
+                teardownBrowseFeatures();
+            } else {
+                startBrowseFeatures();
             }
-            setInterval(backfillPublishedAtFromVisibleDom, config.publishDateBackfillIntervalMs);
-            setTimeout(runContinuousHideCheck, 300);
-            setTimeout(runContinuousHideCheck, 800);
-            setTimeout(() => maintainButtonsNearViewport(config.viewportButtonRefreshMax), 1000);
+
             if (config.debugMode) console.log(formatTranslation('initStarted'));
         } catch (err) {
             console.error(formatTranslation('initError', { error: err.message }));
