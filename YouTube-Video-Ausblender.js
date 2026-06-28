@@ -5,7 +5,7 @@
 // @name:fr Masqueur de Vidéos YouTube avec Icône 🚫 et Basculeur de Shorts
 // @name:it Nascondi Video YouTube con Icona 🚫 e Interruttore Shorts
 // @namespace https://github.com/Copiis/youtube-video-ausblender
-// @version 2026.6.24j
+// @version 2026.6.28a
 // @description Hide videos by ID with restore panel; synced list with upload time, sequential auto-hide
 // @description:de Videos per ID ausblenden mit Einblend-Panel; sync-Liste mit Upload-Zeit, serielles Auto-Ausblenden
 // @description:es Agrega un símbolo 🚫 a los metadatos de video, excluyendo Shorts, y un botón compacto para alternar Shorts con estado persistente
@@ -18,8 +18,8 @@
 // @run-at document-idle
 // @grant GM_setValue
 // @grant GM_getValue
-// @downloadURL https://raw.githubusercontent.com/Copiis/youtube-video-ausblender/master/YouTube-Video-Ausblender.user.js
-// @updateURL https://raw.githubusercontent.com/Copiis/youtube-video-ausblender/master/YouTube-Video-Ausblender.user.js
+// @downloadURL https://raw.githubusercontent.com/Copiis/youtube-video-ausblender/master/YouTube-Video-Ausblender.js
+// @updateURL https://raw.githubusercontent.com/Copiis/youtube-video-ausblender/master/YouTube-Video-Ausblender.js
 // @description If you find this script useful and would like to support my work, consider making a small donation!
 // @description GitHub Sponsors: https://github.com/sponsors/Copiis
 // ==/UserScript==
