@@ -1,6 +1,6 @@
 # YouTube Video Ausblender
 
-Userscript (Tampermonkey) — Videos per 🚫-Symbol ausblenden, Shorts ein-/ausblendbar.
+Userscript (Tampermonkey) — Videos per 🚫-Symbol **über YouTubes natives "Nicht interessiert"** ausblenden, Shorts ein-/ausblendbar.
 
 ## Quelle
 
