@@ -5,7 +5,7 @@
 // @name:fr Masqueur de Vidéos YouTube avec Icône 🚫 et Basculeur de Shorts
 // @name:it Nascondi Video YouTube con Icona 🚫 e Interruttore Shorts
 // @namespace https://github.com/Copiis/youtube-video-ausblender
-// @version 2026.7.11a
+// @version 2026.9.26
 // @description Hide videos using YouTube's native "Not interested"; convenient 🚫 button + Shorts toggle
 // @description:de Videos über YouTubes natives "Nicht interessiert" ausblenden; praktischer 🚫-Button + Shorts-Umschalter
 // @description:es Oculta vídeos usando el mecanismo nativo "No me interesa" de YouTube con botón 🚫 + alternador de Shorts
@@ -33,10 +33,6 @@
         shortsCheckInterval: 2000,
         debugMode: false,   // temporär auf true setzen für detaillierte Logs im Console (bei Menü-Problemen)
         debounceMs: 350,
-        viewportMarginPx: 300,
-        viewportBatchMax: 24,
-        viewportButtonRefreshMax: 48,
-        scrollCheckMs: 200,
         playbackNavGuardMs: 8000,
         playbackDomCleanupDelayMs: 8000
     };
@@ -61,6 +57,8 @@
 
     let observedFeedTargets = new WeakSet();
     let feedMutationObserver = null;
+    let buttonVisibilityObserver = null;
+    let pendingFeedNodes = [];
     let navigationGuardUntil = 0;
     let feedMaintenanceEnabled = true;
     let browseFeaturesActive = false;
@@ -99,6 +97,9 @@
     function disconnectFeedObservers() {
         feedMutationObserver?.disconnect();
         observedFeedTargets = new WeakSet();
+        buttonVisibilityObserver?.disconnect();
+        buttonVisibilityObserver = null;
+        pendingFeedNodes = [];
     }
 
     function disconnectMastheadObserver() {
@@ -160,8 +161,8 @@
         ensureShortsCheckInterval();
         checkShortsSection();
 
-        setTimeout(() => maintainButtonsNearViewport(config.viewportButtonRefreshMax), 400);
-        setTimeout(() => maintainButtonsNearViewport(config.viewportButtonRefreshMax), 900);
+        setTimeout(() => watchContainersForButtons(queryFeedVideoContainers()), 400);
+        setTimeout(() => watchContainersForButtons(queryFeedVideoContainers()), 900);
     }
 
     function isTopLevelVideoContainer(element) {
@@ -710,47 +711,55 @@
         return isReadyForButton(video);
     }
 
-    function isNearViewport(element) {
-        const rect = element.getBoundingClientRect();
-        const margin = config.viewportMarginPx;
-        return rect.bottom >= -margin && rect.top <= window.innerHeight + margin;
+    function getButtonVisibilityObserver() {
+        if (!buttonVisibilityObserver) {
+            buttonVisibilityObserver = new IntersectionObserver((entries) => {
+                if (!shouldShowHideButtons()) return;
+                const due = [];
+                for (const entry of entries) {
+                    if (!entry.isIntersecting) continue;
+                    buttonVisibilityObserver.unobserve(entry.target);
+                    due.push(entry.target);
+                }
+                if (due.length === 0) return;
+                // Erst nach dem Paint anfassen. Ein Eingriff im selben Frame,
+                // in dem YouTube das img befüllt, lässt die Vorschau grau.
+                requestAnimationFrame(() => {
+                    if (!shouldShowHideButtons()) return;
+                    maintainButtons(due);
+                    for (const container of due) {
+                        if (!container.isConnected || container.hasAttribute('data-hide-button-added')) continue;
+                        const tries = Number(container.dataset.ytAusblenderButtonTries || '0') + 1;
+                        if (tries > 8) continue;
+                        container.dataset.ytAusblenderButtonTries = String(tries);
+                        setTimeout(() => {
+                            if (!container.isConnected || container.hasAttribute('data-hide-button-added')) return;
+                            if (!shouldShowHideButtons()) return;
+                            getButtonVisibilityObserver().observe(container);
+                        }, 700);
+                    }
+                });
+            }, {
+                root: null,
+                rootMargin: '0px',
+                threshold: 0
+            });
+        }
+        return buttonVisibilityObserver;
     }
 
-    function isInViewport(element) {
-        const rect = element.getBoundingClientRect();
-        return rect.bottom > 0 && rect.top < window.innerHeight
-            && rect.right > 0 && rect.left < window.innerWidth;
-    }
-
-    function collectContainersNearViewport() {
-        const seen = new Set();
-        const near = [];
-
-        document.querySelectorAll(VIDEO_CONTAINER_SELECTOR).forEach((element) => {
-            if (!isButtonableFeedContainer(element) || seen.has(element)) return;
-            if (!isNearViewport(element)) return;
-            seen.add(element);
-            near.push(element);
-        });
-
-        return near;
-    }
-
-    function maintainButtonsNearViewport(limit = config.viewportBatchMax) {
-        if (!shouldShowHideButtons()) return;
-        const near = collectContainersNearViewport();
-        if (near.length === 0) return;
-        maintainButtons(limit > 0 ? near.slice(0, limit) : near);
-    }
-
-    let maintainButtonsNearViewportTimer = null;
-
-    function scheduleMaintainButtonsNearViewport() {
-        if (maintainButtonsNearViewportTimer) clearTimeout(maintainButtonsNearViewportTimer);
-        maintainButtonsNearViewportTimer = setTimeout(() => {
-            maintainButtonsNearViewportTimer = null;
-            maintainButtonsNearViewport(config.viewportButtonRefreshMax);
-        }, 80);
+    function watchContainersForButtons(containers) {
+        if (!shouldShowHideButtons() || !containers || containers.length === 0) return;
+        const observer = getButtonVisibilityObserver();
+        for (const container of containers) {
+            if (!container?.isConnected || !isButtonableFeedContainer(container)) continue;
+            if (container.hasAttribute('data-hide-button-added')) {
+                const host = findThumbnailHost(container);
+                if (findExistingHideButton(host)) continue;
+                container.removeAttribute('data-hide-button-added');
+            }
+            observer.observe(container);
+        }
     }
 
     function createHideButton(ariaLabel) {
@@ -840,36 +849,18 @@
         };
     }
 
-    function throttle(func, wait) {
-        let lastRun = 0;
-        let trailingTimer = null;
-
-        return function (...args) {
-            const now = Date.now();
-            const remaining = wait - (now - lastRun);
-
-            if (remaining <= 0) {
-                if (trailingTimer) {
-                    clearTimeout(trailingTimer);
-                    trailingTimer = null;
-                }
-                lastRun = now;
-                func.apply(this, args);
-                return;
-            }
-
-            if (!trailingTimer) {
-                trailingTimer = setTimeout(() => {
-                    lastRun = Date.now();
-                    trailingTimer = null;
-                    func.apply(this, args);
-                }, remaining);
-            }
-        };
-    }
-
     function isHideButtonInsideAnchor(btn) {
         return !!btn.closest('a[href*="watch"], a[href*="/shorts/"], a#thumbnail, a.ytLockupViewModelContentImage');
+    }
+
+    function pinButtonHost(mountHost) {
+        if (!mountHost || mountHost.dataset.ytAusblenderPinned === '1') return;
+        mountHost.dataset.ytAusblenderPinned = '1';
+        // Nur static anfassen. position:relative !important hat absolut
+        // platzierte Karten und den Thumbnail-Zuschnitt überschrieben.
+        if (getComputedStyle(mountHost).position === 'static') {
+            mountHost.style.position = 'relative';
+        }
     }
 
     function getHideButtonMountHost(thumbnailHost) {
@@ -896,6 +887,7 @@
             const mountHost = anchor.parentElement;
             anchor.classList.remove('hide-video-btn-host');
             mountHost.classList.add('hide-video-btn-host');
+            pinButtonHost(mountHost);
             mountHost.appendChild(btn);
         });
     }
@@ -930,22 +922,17 @@
         const containers = [];
         const seen = new Set();
 
+        const add = (element) => {
+            if (!element || seen.has(element) || !isFeedVideoContainer(element)) return;
+            seen.add(element);
+            containers.push(element);
+        };
+
         for (const node of nodes) {
             if (node.nodeType !== Node.ELEMENT_NODE) continue;
-
-            if (isFeedVideoContainer(node)) {
-                if (!seen.has(node)) {
-                    seen.add(node);
-                    containers.push(node);
-                }
-                continue;
-            }
-
-            node.querySelectorAll?.(VIDEO_CONTAINER_SELECTOR).forEach((element) => {
-                if (!isFeedVideoContainer(element) || seen.has(element)) return;
-                seen.add(element);
-                containers.push(element);
-            });
+            add(node.closest?.(VIDEO_CONTAINER_SELECTOR));
+            add(node);
+            node.querySelectorAll?.(VIDEO_CONTAINER_SELECTOR).forEach(add);
         }
 
         return containers;
@@ -979,6 +966,7 @@
                     if (mountHost) {
                         thumbnailHost.classList.remove('hide-video-btn-host');
                         mountHost.classList.add('hide-video-btn-host');
+                        pinButtonHost(mountHost);
                         mountHost.appendChild(existingButton);
                     }
                 }
@@ -991,6 +979,7 @@
 
             thumbnailHost.classList.remove('hide-video-btn-host');
             mountHost.classList.add('hide-video-btn-host');
+            pinButtonHost(mountHost);
             mountHost.appendChild(createHideButton(userLang === 'de' ? 'Video ausblenden' : 'Hide video'));
 
             video.setAttribute('data-hide-button-added', 'true');
@@ -1012,32 +1001,21 @@
         }
     }
 
-    function maintainContainers(containers) {
-        maintainButtons(containers);
-    }
-
-    const runFeedMaintenance = debounce((addedNodes = []) => {
+    const flushFeedMaintenance = debounce(() => {
+        const nodes = pendingFeedNodes;
+        pendingFeedNodes = [];
         if (!shouldRunFeedMaintenance()) return;
-
-        if (addedNodes.length === 0) {
-            maintainButtonsNearViewport();
-            return;
-        }
-
-        const pending = collectVideoContainersFromNodes(addedNodes).slice(0, config.viewportBatchMax);
-        if (pending.length > 0) maintainContainers(pending);
-        maintainButtonsNearViewport();
+        const containers = nodes.length > 0
+            ? collectVideoContainersFromNodes(nodes)
+            : queryFeedVideoContainers();
+        watchContainersForButtons(containers);
     }, config.debounceMs);
 
     function queueFeedMaintenance(addedNodes = []) {
         if (!shouldRunFeedMaintenance()) return;
-        runFeedMaintenance(addedNodes);
+        if (addedNodes.length > 0) pendingFeedNodes.push(...addedNodes);
+        flushFeedMaintenance();
     }
-
-    const onViewportScroll = throttle(() => {
-        if (!shouldRunFeedMaintenance()) return;
-        maintainButtonsNearViewport();
-    }, config.scrollCheckMs);
 
     let isShortsHidden = GM_getValue('isShortsHidden', false);
     let shortsCheckIntervalId = null;
@@ -1270,10 +1248,6 @@
     const style = document.createElement('style');
     style.id = 'yt-video-ausblender-styles';
     style.textContent = `
-        .hide-video-btn-host {
-            position: relative !important;
-            overflow: visible !important;
-        }
         .hide-video-btn {
             width: ${config.hideButtonSize} !important;
             height: ${config.hideButtonSize} !important;
@@ -1529,7 +1503,6 @@
         try {
             injectStyles();
             setupNavigationListeners();
-            window.addEventListener('scroll', onViewportScroll, { passive: true });
             if (isPlaybackPage()) {
                 teardownBrowseFeatures();
             } else {
