@@ -5,7 +5,7 @@
 // @name:fr Masqueur de Vidéos YouTube avec Icône 🚫 et Basculeur de Shorts
 // @name:it Nascondi Video YouTube con Icona 🚫 e Interruttore Shorts
 // @namespace https://github.com/Copiis/youtube-video-ausblender
-// @version 2026.9.26
+// @version 2026.10.20
 // @description Hide videos using YouTube's native "Not interested"; convenient 🚫 button + Shorts toggle
 // @description:de Videos über YouTubes natives "Nicht interessiert" ausblenden; praktischer 🚫-Button + Shorts-Umschalter
 // @description:es Oculta vídeos usando el mecanismo nativo "No me interesa" de YouTube con botón 🚫 + alternador de Shorts
@@ -65,6 +65,8 @@
     let mastheadMutationObserver = null;
     let navigationListenersInstalled = false;
     let playbackDomCleanupTimer = null;
+    let feedRescanGeneration = 0;
+    let feedScrollRescanInstalled = false;
 
     function isInExcludedUiArea(element) {
         return !!(element && element.closest(EXCLUDED_UI_SELECTOR));
@@ -161,8 +163,8 @@
         ensureShortsCheckInterval();
         checkShortsSection();
 
-        setTimeout(() => watchContainersForButtons(queryFeedVideoContainers()), 400);
-        setTimeout(() => watchContainersForButtons(queryFeedVideoContainers()), 900);
+        installFeedScrollRescan();
+        scheduleFeedRescan();
     }
 
     function isTopLevelVideoContainer(element) {
@@ -185,6 +187,10 @@
 
     function activateNavigationGuard(durationMs = config.playbackNavGuardMs) {
         navigationGuardUntil = Math.max(navigationGuardUntil, Date.now() + durationMs);
+    }
+
+    function clearNavigationGuard() {
+        navigationGuardUntil = 0;
     }
 
     function isFeedVideoContainer(element) {
@@ -217,12 +223,21 @@
             || null;
     }
 
+    function thumbnailAllowsButton(video) {
+        const host = findThumbnailHost(video);
+        if (!host) return false;
+        const img = host.tagName === 'IMG' ? host : host.querySelector('img');
+        // Kein img im offenen DOM: Komponente mit Shadow-Bild, Button trotzdem setzen.
+        if (!img) return true;
+        return isYtThumbnailSrc(img.currentSrc || img.getAttribute('src') || '');
+    }
+
     function isReadyForButton(element) {
         if (!shouldShowHideButtons()) return false;
         if (isNavigationGuardActive()) return false;
         if (!isButtonableFeedContainer(element)) return false;
         if (!extractVideoId(element)) return false;
-        if (!findThumbnailHost(element)) return false;
+        if (!thumbnailAllowsButton(element)) return false;
         return true;
     }
 
@@ -714,7 +729,17 @@
     function getButtonVisibilityObserver() {
         if (!buttonVisibilityObserver) {
             buttonVisibilityObserver = new IntersectionObserver((entries) => {
-                if (!shouldShowHideButtons()) return;
+                if (!shouldShowHideButtons()) {
+                    if (!isNavigationGuardActive() || isPlaybackPage() || !feedMaintenanceEnabled) return;
+                    const wait = Math.max(120, navigationGuardUntil - Date.now() + 60);
+                    setTimeout(() => {
+                        if (!buttonVisibilityObserver || !shouldShowHideButtons()) return;
+                        for (const entry of entries) {
+                            if (entry.target?.isConnected) buttonVisibilityObserver.observe(entry.target);
+                        }
+                    }, Math.min(wait, 1500));
+                    return;
+                }
                 const due = [];
                 for (const entry of entries) {
                     if (!entry.isIntersecting) continue;
@@ -730,7 +755,7 @@
                     for (const container of due) {
                         if (!container.isConnected || container.hasAttribute('data-hide-button-added')) continue;
                         const tries = Number(container.dataset.ytAusblenderButtonTries || '0') + 1;
-                        if (tries > 8) continue;
+                        if (tries > 20) continue;
                         container.dataset.ytAusblenderButtonTries = String(tries);
                         setTimeout(() => {
                             if (!container.isConnected || container.hasAttribute('data-hide-button-added')) return;
@@ -741,7 +766,7 @@
                 });
             }, {
                 root: null,
-                rootMargin: '0px',
+                rootMargin: '480px 0px',
                 threshold: 0
             });
         }
@@ -749,7 +774,13 @@
     }
 
     function watchContainersForButtons(containers) {
-        if (!shouldShowHideButtons() || !containers || containers.length === 0) return;
+        if (!containers || containers.length === 0) return;
+        if (!shouldShowHideButtons()) {
+            if (!isNavigationGuardActive() || isPlaybackPage() || !feedMaintenanceEnabled) return;
+            const wait = Math.max(120, navigationGuardUntil - Date.now() + 60);
+            setTimeout(() => watchContainersForButtons(containers), Math.min(wait, 1500));
+            return;
+        }
         const observer = getButtonVisibilityObserver();
         for (const container of containers) {
             if (!container?.isConnected || !isButtonableFeedContainer(container)) continue;
@@ -1012,9 +1043,56 @@
     }, config.debounceMs);
 
     function queueFeedMaintenance(addedNodes = []) {
-        if (!shouldRunFeedMaintenance()) return;
+        if (!feedMaintenanceEnabled || isPlaybackPage()) return;
         if (addedNodes.length > 0) pendingFeedNodes.push(...addedNodes);
+        if (!shouldRunFeedMaintenance()) {
+            const wait = Math.max(80, navigationGuardUntil - Date.now() + 40);
+            setTimeout(() => {
+                if (shouldRunFeedMaintenance()) flushFeedMaintenance();
+            }, Math.min(wait, 2000));
+            return;
+        }
         flushFeedMaintenance();
+    }
+
+    function refreshFeedButtons() {
+        if (!shouldShowHideButtons()) return;
+        ensureFeedMutationObserver();
+        const containers = queryFeedVideoContainers().filter((container) => isButtonableFeedContainer(container));
+        maintainButtons(containers);
+        watchContainersForButtons(containers);
+    }
+
+    function scheduleFeedRescan() {
+        const generation = ++feedRescanGeneration;
+        for (const delay of [250, 800, 1600, 3200]) {
+            setTimeout(() => {
+                if (generation !== feedRescanGeneration) return;
+                refreshFeedButtons();
+            }, delay);
+        }
+    }
+
+    function installFeedScrollRescan() {
+        if (feedScrollRescanInstalled) return;
+        feedScrollRescanInstalled = true;
+        const onScroll = debounce(() => {
+            if (!shouldShowHideButtons()) return;
+            watchContainersForButtons(queryFeedVideoContainers());
+        }, 250);
+        window.addEventListener('scroll', onScroll, { passive: true, capture: true });
+    }
+
+    function syncBrowseFeatures() {
+        if (isPlaybackPage()) {
+            if (browseFeaturesActive || feedMaintenanceEnabled) pauseBrowseFeatures();
+            if (!playbackDomCleanupTimer) schedulePlaybackDomCleanup();
+            return;
+        }
+        cancelPlaybackDomCleanup();
+        clearNavigationGuard();
+        if (!browseFeaturesActive) startBrowseFeatures();
+        else scheduleFeedRescan();
     }
 
     let isShortsHidden = GM_getValue('isShortsHidden', false);
@@ -1476,20 +1554,28 @@
         (document.head || document.documentElement).appendChild(style);
     }
 
-    function onNavigationStart() {
+    function navigationGoesToPlayback(event) {
+        const detail = event && event.detail;
+        const url = detail && (detail.url || detail.href || '');
+        const pageType = detail && (detail.pageType || '');
+        if (/watch|shorts/i.test(String(pageType))) return true;
+        if (typeof url === 'string' && /(\/watch\b|\/shorts\/|\/live\b)/.test(url)) return true;
+        return isPlaybackPage();
+    }
+
+    function onNavigationStart(event) {
         cancelPlaybackDomCleanup();
         pauseBrowseFeatures();
         activateNavigationGuard(config.playbackNavGuardMs);
+        if (navigationGoesToPlayback(event)) return;
+        // Zurück zur Übersicht feuert oft kein yt-navigate-finish. Dann bleiben
+        // nur die Buttons der ersten Reihen, weil die unteren neu aufgebaut werden.
+        setTimeout(syncBrowseFeatures, 400);
+        setTimeout(syncBrowseFeatures, 1200);
     }
 
     function onNavigationFinish() {
-        if (isPlaybackPage()) {
-            pauseBrowseFeatures();
-            schedulePlaybackDomCleanup();
-        } else {
-            cancelPlaybackDomCleanup();
-            startBrowseFeatures();
-        }
+        syncBrowseFeatures();
     }
 
     function setupNavigationListeners() {
@@ -1497,6 +1583,12 @@
         navigationListenersInstalled = true;
         document.addEventListener('yt-navigate-start', onNavigationStart);
         document.addEventListener('yt-navigate-finish', onNavigationFinish);
+        document.addEventListener('yt-page-data-updated', () => syncBrowseFeatures());
+        window.addEventListener('popstate', () => setTimeout(syncBrowseFeatures, 50));
+        window.addEventListener('pageshow', () => syncBrowseFeatures());
+        document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState === 'visible') syncBrowseFeatures();
+        });
     }
 
     function initialize() {
