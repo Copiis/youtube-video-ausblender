@@ -5,7 +5,7 @@
 // @name:fr Masqueur de Vidéos YouTube avec Icône 🚫 et Basculeur de Shorts
 // @name:it Nascondi Video YouTube con Icona 🚫 e Interruttore Shorts
 // @namespace https://github.com/Copiis/youtube-video-ausblender
-// @version 2026.10.20
+// @version 2026.10.24
 // @description Hide videos using YouTube's native "Not interested"; convenient 🚫 button + Shorts toggle
 // @description:de Videos über YouTubes natives "Nicht interessiert" ausblenden; praktischer 🚫-Button + Shorts-Umschalter
 // @description:es Oculta vídeos usando el mecanismo nativo "No me interesa" de YouTube con botón 🚫 + alternador de Shorts
@@ -66,6 +66,8 @@
     let navigationListenersInstalled = false;
     let playbackDomCleanupTimer = null;
     let feedRescanGeneration = 0;
+    let returnRescanGeneration = 0;
+    let feedButtonIntervalId = null;
     let feedScrollRescanInstalled = false;
 
     function isInExcludedUiArea(element) {
@@ -93,6 +95,10 @@
         if (shortsCheckIntervalId) {
             clearInterval(shortsCheckIntervalId);
             shortsCheckIntervalId = null;
+        }
+        if (feedButtonIntervalId) {
+            clearInterval(feedButtonIntervalId);
+            feedButtonIntervalId = null;
         }
     }
 
@@ -164,6 +170,7 @@
         checkShortsSection();
 
         installFeedScrollRescan();
+        ensureFeedButtonInterval();
         scheduleFeedRescan();
     }
 
@@ -750,7 +757,17 @@
                 // Erst nach dem Paint anfassen. Ein Eingriff im selben Frame,
                 // in dem YouTube das img befüllt, lässt die Vorschau grau.
                 requestAnimationFrame(() => {
-                    if (!shouldShowHideButtons()) return;
+                    if (!shouldShowHideButtons()) {
+                        for (const container of due) {
+                            if (!container.isConnected) continue;
+                            setTimeout(() => {
+                                if (!container.isConnected || container.hasAttribute('data-hide-button-added')) return;
+                                if (!shouldShowHideButtons()) return;
+                                getButtonVisibilityObserver().observe(container);
+                            }, 700);
+                        }
+                        return;
+                    }
                     maintainButtons(due);
                     for (const container of due) {
                         if (!container.isConnected || container.hasAttribute('data-hide-button-added')) continue;
@@ -1065,10 +1082,30 @@
 
     function scheduleFeedRescan() {
         const generation = ++feedRescanGeneration;
-        for (const delay of [250, 800, 1600, 3200]) {
+        for (const delay of [250, 800, 1600, 3200, 6000, 10000]) {
             setTimeout(() => {
                 if (generation !== feedRescanGeneration) return;
                 refreshFeedButtons();
+            }, delay);
+        }
+    }
+
+    function ensureFeedButtonInterval() {
+        if (feedButtonIntervalId) return;
+        // YouTube baut Reihe 4 und alles darunter oft erst nach den ersten
+        // Timern. Ohne Scroll bleibt der Button sonst weg, bis die Seite neu lädt.
+        feedButtonIntervalId = setInterval(() => {
+            if (!shouldShowHideButtons()) return;
+            refreshFeedButtons();
+        }, 1000);
+    }
+
+    function scheduleReturnRescans() {
+        const generation = ++returnRescanGeneration;
+        for (const delay of [400, 1200, 2500, 5000, 8000]) {
+            setTimeout(() => {
+                if (generation !== returnRescanGeneration) return;
+                syncBrowseFeatures();
             }, delay);
         }
     }
@@ -1554,28 +1591,19 @@
         (document.head || document.documentElement).appendChild(style);
     }
 
-    function navigationGoesToPlayback(event) {
-        const detail = event && event.detail;
-        const url = detail && (detail.url || detail.href || '');
-        const pageType = detail && (detail.pageType || '');
-        if (/watch|shorts/i.test(String(pageType))) return true;
-        if (typeof url === 'string' && /(\/watch\b|\/shorts\/|\/live\b)/.test(url)) return true;
-        return isPlaybackPage();
-    }
-
-    function onNavigationStart(event) {
+    function onNavigationStart() {
         cancelPlaybackDomCleanup();
         pauseBrowseFeatures();
         activateNavigationGuard(config.playbackNavGuardMs);
-        if (navigationGoesToPlayback(event)) return;
-        // Zurück zur Übersicht feuert oft kein yt-navigate-finish. Dann bleiben
-        // nur die Buttons der ersten Reihen, weil die unteren neu aufgebaut werden.
-        setTimeout(syncBrowseFeatures, 400);
-        setTimeout(syncBrowseFeatures, 1200);
+        // Beim Zurück ist die Adresse oft noch /watch, und yt-navigate-finish
+        // bleibt aus. Die ersten Reihen behalten den Button, ab Reihe 4 baut
+        // YouTube neu. Deshalb immer nachprüfen, auch wenn es noch wie ein Video aussieht.
+        scheduleReturnRescans();
     }
 
     function onNavigationFinish() {
         syncBrowseFeatures();
+        scheduleReturnRescans();
     }
 
     function setupNavigationListeners() {
@@ -1584,7 +1612,7 @@
         document.addEventListener('yt-navigate-start', onNavigationStart);
         document.addEventListener('yt-navigate-finish', onNavigationFinish);
         document.addEventListener('yt-page-data-updated', () => syncBrowseFeatures());
-        window.addEventListener('popstate', () => setTimeout(syncBrowseFeatures, 50));
+        window.addEventListener('popstate', () => scheduleReturnRescans());
         window.addEventListener('pageshow', () => syncBrowseFeatures());
         document.addEventListener('visibilitychange', () => {
             if (document.visibilityState === 'visible') syncBrowseFeatures();
